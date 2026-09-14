@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Large binary model checkpoints
+*.bin
+*.ftz
+models/
+data/*.bin
+
+# Generated datasets, chunks, and test streams
+*.jsonl
+*.txt
+!examples/*.txt
+data/*.jsonl
+
+# Scratch files and OS metadata
+.DS_Store
+Thumbs.db
+*.swp
+*~
