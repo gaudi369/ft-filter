@@ -2,7 +2,7 @@ mod infer;
 mod model;
 mod tokenize;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use memmap2::Mmap;
 use serde_json::Value;
 use std::fs::File;
@@ -10,96 +10,158 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Lean single-threaded FastText CPU filter", long_about = None)]
+#[command(name = "ft-filter", version, about = "High-throughput CPU FastText engine")]
 struct Cli {
-    #[arg(short = 'm', long = "model", value_name = "PATH")]
-    model: PathBuf,
-
-    #[arg(short = 'i', long = "input", value_name = "PATH")]
-    input: Option<PathBuf>,
-
-    #[arg(short = 'o', long = "output", value_name = "PATH")]
-    output: Option<PathBuf>,
-
-    #[arg(short = 'f', long = "format", default_value = "jsonl")]
-    format: String,
-
-    #[arg(short = 'k', long = "json-key", default_value = "text")]
-    json_key: String,
-
-    #[arg(short = 't', long = "threshold", default_value_t = 0.5)]
-    threshold: f32,
-
-    #[arg(short = 'l', long = "label")]
-    label: Option<String>,
+    #[command(subcommand)]
+    command: Commands,
 }
 
-fn main() -> io::Result<()> {
-    let cli = Cli::parse();
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Filter or annotate text using a pre-trained FastText binary model
+    Filter(FilterArgs),
+    /// Train a new FastText binary model
+    Train(TrainArgs),
+}
 
-    // Map the model file into memory (zero-copy, demand-paged).
-    let model_file = File::open(&cli.model)?;
+#[derive(Args, Debug, Clone)]
+pub struct FilterArgs {
+    #[arg(short = 'm', long = "model", value_name = "PATH")]
+    pub model: PathBuf,
+
+    #[arg(short = 'i', long = "input", value_name = "PATH")]
+    pub input: Option<PathBuf>,
+
+    #[arg(short = 'o', long = "output", value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
+    #[arg(short = 'f', long = "format", default_value = "jsonl")]
+    pub format: String,
+
+    #[arg(short = 'k', long = "json-key", default_value = "text")]
+    pub json_key: String,
+
+    #[arg(short = 't', long = "threshold", default_value_t = 0.5)]
+    pub threshold: f32,
+
+    #[arg(short = 'v', long = "invert", default_value_t = false)]
+    pub invert: bool,
+
+    #[arg(short = 's', long = "emit-score", default_value_t = false)]
+    pub emit_score: bool,
+
+    #[arg(long = "score-key", default_value = "ft_score")]
+    pub score_key: String,
+
+    #[arg(short = 'l', long = "label")]
+    pub label: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TrainArgs {
+    #[arg(short = 'i', long = "input", value_name = "PATH")]
+    pub input: PathBuf,
+
+    #[arg(short = 'o', long = "output", value_name = "PATH")]
+    pub output: PathBuf,
+
+    #[arg(long = "dim", default_value_t = 256)]
+    pub dim: usize,
+
+    #[arg(long = "lr", default_value_t = 0.1)]
+    pub lr: f32,
+
+    #[arg(long = "epochs", default_value_t = 5)]
+    pub epochs: usize,
+
+    #[arg(long = "bucket", default_value_t = 2_000_000)]
+    pub bucket: usize,
+
+    #[arg(long = "minn", default_value_t = 3)]
+    pub minn: usize,
+
+    #[arg(long = "maxn", default_value_t = 6)]
+    pub maxn: usize,
+
+    #[arg(long = "min-count", default_value_t = 5)]
+    pub min_count: u64,
+}
+
+fn run_filter(args: FilterArgs) -> io::Result<()> {
+    let model_file = File::open(&args.model)?;
     let mmap = unsafe { Mmap::map(&model_file)? };
     let model = model::Model::load_from_bytes(&mmap)?;
 
-    // Determine target label (auto-detect first if unspecified).
-    let target_label = cli
-        .label
-        .clone()
-        .unwrap_or_else(|| {
-            model
-                .labels
-                .first()
-                .cloned()
-                .expect("Model contains no output labels")
-        });
+    let target_label = args.label.clone().unwrap_or_else(|| {
+        model.labels.first().cloned().expect("Model contains no output labels")
+    });
     let label_idx = *model
         .label2id
         .get(&target_label)
-        .expect("Target label not found in model");
+        .unwrap_or_else(|| panic!("Label '{}' not found in model", target_label));
 
-    // Input reader
-    let reader: Box<dyn BufRead> = match cli.input {
-        Some(path) => Box::new(BufReader::with_capacity(
-            1024 * 1024,
-            File::open(path)?,
-        )),
+    let reader: Box<dyn BufRead> = match &args.input {
+        Some(path) => Box::new(BufReader::with_capacity(1024 * 1024, File::open(path)?)),
         None => Box::new(BufReader::with_capacity(1024 * 1024, io::stdin())),
     };
 
-    // Output writer
-    let mut writer: Box<dyn Write> = match cli.output {
-        Some(path) => Box::new(BufWriter::with_capacity(
-            1024 * 1024,
-            File::create(path)?,
-        )),
+    let mut writer: Box<dyn Write> = match &args.output {
+        Some(path) => Box::new(BufWriter::with_capacity(1024 * 1024, File::create(path)?)),
         None => Box::new(BufWriter::with_capacity(1024 * 1024, io::stdout())),
     };
 
     let mut session = infer::InferSession::new(model.args.dim);
-    let mut line_buf = String::with_capacity(8192);
+    let mut line_buf = String::with_capacity(16384);
     let mut reader = reader;
-
-    let is_jsonl = cli.format == "jsonl";
+    let is_jsonl = args.format == "jsonl";
 
     while reader.read_line(&mut line_buf)? > 0 {
+        let trimmed_line = line_buf.trim_end();
+        if trimmed_line.is_empty() {
+            line_buf.clear();
+            continue;
+        }
+
+        let mut parsed_obj = None;
         let prob = if is_jsonl {
-            match serde_json::from_str::<Value>(&line_buf) {
-                Ok(Value::Object(map)) => {
-                    if let Some(Value::String(text)) = map.get(&cli.json_key) {
-                        session.predict_label_prob(text, &model, label_idx)
-                    } else {
-                        0.0
-                    }
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed_line) {
+                let score = if let Some(text) = map.get(&args.json_key).and_then(|v| v.as_str()) {
+                    session.predict_label_prob(text, &model, label_idx)
+                } else {
+                    0.0
+                };
+                if args.emit_score {
+                    parsed_obj = Some(map);
                 }
-                _ => 0.0,
+                score
+            } else {
+                0.0
             }
         } else {
-            session.predict_label_prob(line_buf.trim_end(), &model, label_idx)
+            session.predict_label_prob(trimmed_line, &model, label_idx)
         };
 
-        if prob >= cli.threshold {
-            writer.write_all(line_buf.as_bytes())?;
+        let passes = if args.invert {
+            prob < args.threshold
+        } else {
+            prob >= args.threshold
+        };
+
+        if passes {
+            if args.emit_score {
+                if is_jsonl {
+                    if let Some(mut map) = parsed_obj {
+                        map.insert(args.score_key.clone(), serde_json::json!(prob));
+                        serde_json::to_writer(&mut writer, &map)?;
+                        writer.write_all(b"\n")?;
+                    }
+                } else {
+                    writeln!(writer, "{:.5}\t{}", prob, trimmed_line)?;
+                }
+            } else {
+                writer.write_all(trimmed_line.as_bytes())?;
+                writer.write_all(b"\n")?;
+            }
         }
 
         line_buf.clear();
@@ -107,4 +169,15 @@ fn main() -> io::Result<()> {
 
     writer.flush()?;
     Ok(())
+}
+
+fn main() -> io::Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Filter(args) => run_filter(args),
+        Commands::Train(_) => {
+            eprintln!("Training implementation will be hooked here.");
+            Ok(())
+        }
+    }
 }
