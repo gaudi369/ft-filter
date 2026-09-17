@@ -1,0 +1,18 @@
+[project]
+name = "ft-filter"
+version = "0.1.0"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+# platforms = ["linux-64", "osx-arm64", "osx-64", "win-64"]
+
+[dependencies]
+python = ">=3.10"
+numpy = "<2.0.0"
+fasttext = ">=0.9.2"
+datasets = ">=2.18.0"
+requests = ">=2.31.0"
+tqdm = ">=4.66.0"
+
+[tasks]
+build-release = "cargo build --release"
+test-fineweb = { cmd = "python tests/verify_fineweb.py", depends-on = ["build-release"] }
