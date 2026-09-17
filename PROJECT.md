@@ -1,73 +1,113 @@
-Project Specification: ft-filter (Single-Threaded CPU FastText Engine)
-A lean, single-threaded CPU inference engine designed for local LLM practitioners to filter large text corpora using pre-trained FastText binary classifiers (.bin).
-1. Goals and Non-Goals
-Goals
- * Native Single-Threaded Throughput: Exceed 100,000 tokens/second on modern consumer x86_64 CPUs (AVX2).
- * Streaming I/O: Classify text line-by-line or from JSONL streams without reading entire datasets into RAM.
- * Low Memory Footprint: Keep RAM overhead under 2 GB (storing only model parameters and small per-document accumulation buffers).
- * Deterministic Output: Produce numerical classification probabilities that match the official C++ FastText output to within floating-point epsilon (\le 10^{-5}).
-Non-Goals
- * FP16 / Sub-Byte Quantization: Maintain FP32 weights exclusively to preserve simplicity and avoid conversion latency on consumer x86_64 chips.
- * Multi-Threading / Thread Pools: Keep code strictly single-threaded. Concurrency is delegated to the operating system (e.g., via xargs -P or GNU parallel over separate files).
- * GPU / DirectML / Metal Acceleration: Pure CPU implementation.
- * Dynamic Training Dictionaries: No complex vocabulary tree mutations; treat the loaded model as immutable data.
-2. Dependencies & Ecosystem Choices
-The implementation should be written in Rust to enforce strict memory safety and avoid external runtime dependencies.
- * serde + serde_json: Zero-copy or borrowed parsing for JSONL documents (extracting the "text" field).
- * byteorder: Reading little-endian binary headers from FastText .bin checkpoints.
- * std::io streaming: Model matrices are bulk-read from the file in bounded chunks instead of being copied out of a memory map. FastText stores matrices at byte-unaligned file offsets (dictionary entries have variable length), so mmap-based loading inevitably touches every matrix page and then doubles peak RSS with a heap copy; streaming load halves it (e.g. 4.0 GiB -> 2.0 GiB for the 2 GB UltraFineWeb model). memmap2 was removed when the last mmap use disappeared.
- * clap: CLI flag and argument parsing.
-Deliberately Excluded (Avoid Implementing or Adding):
- * tch-rs or onnxruntime: Adds runtime overhead and dynamic library dependencies.
- * External BLAS/LAPACK (OpenBLAS, MKL): Unnecessary; a 256-wide dot product is small enough for straightforward vector intrinsics or auto-vectorized loops.
-3. Architecture & Internal Components
-A. Model File Parser (model.rs)
-The parser reads the official FastText binary layout:
- * Magic Header: Check for FASTTEXT_FILEFORMAT_MAGIC_INT32 = 793712314 (0x2F4F16BA).
- * Parameters: Read 32-bit integers: dim (typically 256), ws, epoch, minCount, neg, wordNgrams, loss, model, bucket, minn, maxn, lrUpdateRate, followed by float64 t.
- * Vocabulary Dict: Read vocabulary tokens, word frequencies, and entry types (word vs label). Identify output label IDs.
- * Input Matrix (W_{in}): Float32 array of shape (vocab_size + bucket) x dim.
- * Output Matrix (W_{out}): Float32 array of shape num_labels x dim.
-B. Zero-Allocation Tokenizer & Hasher (tokenize.rs)
- * Token Splitting: Split only on FastText's ASCII separators (space, LF, CR, tab, vertical tab, form feed, NUL), not punctuation or Unicode whitespace. Scan borrowed slices without allocating intermediate String instances. Treat each JSONL text as one document, replacing embedded LF with spaces semantically, and append the end-of-line token </s> (matching Python predict(text.replace("\n", " "))).
- * FastText FNV-1a Hashing: FastText uses an explicit variant of the 32-bit FNV-1a algorithm for subword n-grams:
-   pub fn fasttext_hash(bytes: &[u8]) -> u32 {
-    let mut h: u32 = 2166136261;
-    for &b in bytes {
-        h = (h ^ (b as i8 as u32)).wrapping_mul(16777619);
-    }
-    h
-}
+# Project Specification: ft-filter
 
- * Subword Generator: For words not in the explicit vocabulary (or in addition to vocabulary words if configured), virtually wrap the word with boundary tokens < and >, slice all UTF-8 character n-grams between minn and maxn, and map each to a bucket index. Include whole-word n-grams; exclude only standalone boundary characters. Never generate subwords for </s>.
- * Word N-grams: Honor wordNgrams using the upstream wrapping uint64 hash over sign-extended int32 word hashes, including OOV words and EOS but excluding labels. Accumulate each word and its subwords in token order, then word n-grams, to preserve FP32 rounding order.
-   
-C. SIMD Accumulator & Linear Head (infer.rs)
- * Accumulator Buffer: Maintain a single reusable stack- or pre-allocated heap-allocated vector acc: [f32; 256] initialized to zeros.
- * Vectorized Addition (AVX2): For each token/subword ID, add the 256-float slice from W_{in} into acc using AVX2 instructions (_mm256_add_ps / _mm256_loadu_ps) or standard 8-element unrolled loops marked with #[inline(always)] to facilitate compiler auto-vectorization.
- * Mean Reduction: Divide all elements in acc by \max(1, N) where N is the total number of valid subwords and tokens in the document.
- * Projection & Activation: Compute the inner product between acc and each row of W_{out}. Match the saved loss: softmax, hierarchical softmax, or lookup-table sigmoid for negative sampling/one-vs-all. Prediction scores use upstream's exp(log(p + 1e-5)) convention (per branch, root-first, for hierarchical softmax), not just unsmoothed probabilities. Consequently scores can slightly exceed 1.0.
-D. Stream Pipeline (main.rs)
- * Read from standard input (stdin) or a file path.
- * Iterate line-by-line via BufRead::read_line or iterate records using serde_json::Deserializer::from_reader(stream).into_iter::<Record>().
- * If probability exceeds --threshold (e.g., 0.5), emit the line to standard output (stdout).
-4. CLI Interface Specification
-ft-filter [OPTIONS] --model <MODEL_PATH>
+A lean, single-threaded CPU inference engine that filters large text corpora with
+pre-trained FastText binary classifiers (`.bin`). Built for local LLM data
+curation (quality filtering, language identification) with no Python, ONNX, or
+GPU dependencies at runtime.
 
-OPTIONS:
-    -m, --model <PATH>          Path to the FastText .bin file [required]
-    -i, --input <PATH>          Input file path (defaults to stdin if omitted)
-    -o, --output <PATH>         Output file path (defaults to stdout if omitted)
-    -f, --format <FORMAT>       Input format: 'raw' (line-by-line) or 'jsonl' [default: jsonl]
-    -k, --json-key <KEY>        Key name to extract when using jsonl [default: text]
-    -t, --threshold <FLOAT>     Probability threshold to retain document [default: 0.5]
-    -l, --label <STRING>        Target label to check (e.g., "__label__hq") [default: auto-detect first]
-    -h, --help                  Print help information
+## 1. Design Goals
 
-5. Verification & Acceptance Criteria
- * Unit Test - Hash Parity: Write a test verifying fasttext_hash against known test vectors from the reference implementation (e.g., "hello", "<the>").
- * Integration Test - Prediction Parity: Given a sample .bin model and 100 test sentences:
-   * Run inference with official fasttext predict-prob model.bin -.
-   * Run inference with ft-filter.
-   * Ensure predicted probabilities match within \pm 0.00001.
- * Benchmark Target: Process an uncompressed text file containing \ge 50\text{MB} of raw text on an AVX2-compatible consumer CPU using a single core at a rate of \ge 80,000 tokens/second.
+1. **FastText parity.** Classification probabilities match the official C++
+   fastText output within `1e-5` (measured: bit-identical on all test suites).
+2. **Streaming I/O.** Classify line-by-line or from JSONL streams without loading
+   corpora into RAM.
+3. **Low memory footprint.** Store only model parameters plus small per-document
+   buffers. Peak RSS for the 2 GB UltraFineWeb classifier is ~2.0 GiB.
+4. **Single-core throughput.** Targets AVX2-class consumer x86_64 CPUs; measured
+   ~2.4M ASCII tokens/s (dim=256) and ~1.9M tokens/s (dim=16, subwords) on one core.
+5. **Model generality.** Any supervised FastText `.bin` works: all four loss
+   heads (hierarchical softmax, negative sampling, one-vs-all, softmax), any
+   embedding dimension, subwords on or off, word n-grams on or off, pruned and
+   unpruned dictionaries.
+
+## 2. Intentional Tradeoffs
+
+* **FP32 only.** No FP16 or sub-byte quantization; weights are used exactly as
+  saved. (Quantized `.ftz` models are rejected with a clear error.)
+* **Strictly single-threaded.** Parallelism is delegated to the OS
+  (`xargs -P`, GNU parallel) over separate files.
+* **Upstream numerical semantics, not "prettier" math.** Scores reproduce
+  upstream's `exp(log(p + 1e-5))` smoothing, the 512-entry sigmoid lookup table
+  for NS/OVA, and per-branch root-first log-probability accumulation for
+  hierarchical softmax. Consequently scores can slightly exceed 1.0.
+* **Exact feature semantics.** ASCII-only token separators, signed-char FNV-1a
+  hashing, UTF-8 character subwords including whole words, upstream's wrapping
+  uint64 word-ngram hash, and document-level EOS. These reproduce fastText's
+  rounding order bit-for-bit rather than approximating it.
+* **Vectorization via codegen, not intrinsics.** AVX2 comes from
+  `target-cpu=x86-64-v3` in `.cargo/config.toml`; there is no hand-written SIMD
+  and no runtime dispatch. Wider registers preserve per-element FP32 add order,
+  so parity is unaffected.
+* **No mmap for model loading.** FastText matrices sit at byte-unaligned file
+  offsets, so any mmap-based loader touches every matrix page and then doubles
+  RSS with a heap copy. Matrices are bulk-read from the file in bounded chunks
+  instead (see Architecture); `memmap2` was removed when its last use
+  disappeared.
+* **Training is a stub.** The `train` subcommand exists as a CLI placeholder
+  only; models are always loaded, never trained.
+
+## 3. Architecture
+
+```
+src/
+  model.rs     FastText .bin parser + ordered subword-ID cache
+  tokenize.rs  ASCII token splitting, FNV-1a hashing, subword n-grams
+  infer.rs     feature accumulation, mean reduction, scoring heads
+  main.rs      CLI, stream pipeline, JSONL handling, --stats
+```
+
+* **Parser (`model.rs`).** Validates the magic header (`0x2F4F16BA`, version 12)
+  and reads the 13 integer parameters plus float64 `t`, the dictionary (token,
+  count, entry type; words precede labels), the optional pruning map, and the
+  two FP32 matrices. Header/dictionary parse sequentially from a buffered
+  reader; matrices are read in 8 MiB chunks into owned buffers, so the file is
+  read once and never fully resident. The Huffman tree for hierarchical softmax
+  is rebuilt exactly as upstream does from label counts.
+* **Tokenizer (`tokenize.rs`).** Splits on fastText's seven ASCII separators
+  only (space, LF, CR, tab, VT, FF, NUL) over borrowed slices; no allocations.
+  Subword n-grams are generated over the virtual `<word>` with UTF-8 character
+  boundaries, excluding only standalone boundary characters, never `</s>`.
+* **Subword cache (`model.rs`).** At load time the already-pruned subword IDs
+  for the most frequent vocabulary words are stored in original order (bounded
+  at 65,536 words / 1,048,576 IDs ≈ 8 MiB). Inference reuses them for known
+  words and falls back to on-the-fly generation for everything else. Order,
+  duplicates, and pruning semantics are preserved exactly.
+* **Inference (`infer.rs`).** One reusable accumulator; features are added in
+  upstream order (each word then its subwords, then word n-grams), divided by
+  the feature count, and projected through the matching scoring head. Word
+  hashes are computed only when the model actually uses word n-grams.
+* **Pipeline (`main.rs`).** Reads stdin or `--input` line-by-line (JSONL by
+  default: each record's `--json-key` field is scored as one document, embedded
+  LF treated as space, matching Python `predict(text.replace("\n", " "))`).
+  Records passing `--threshold` are emitted unchanged to stdout or `--output`
+  (`--emit-score` annotates them with the probability, `--invert` flips the
+  comparison). `filter --stats` prints a JSON line with load/processing time,
+  input bytes, record and pass counts to stderr.
+
+## 4. Platform Support Status
+
+| Component | Status |
+|---|---|
+| Linux x86_64 | **Supported and tested** (development and CI environment; pixi `linux-64`). |
+| Binary ISA | Release builds target x86-64-v3 (AVX2 baseline, Haswell 2013+). Older x86_64 CPUs abort with SIGILL; delete `.cargo/config.toml` for a conservative baseline build. |
+| macOS / Windows | Untested. The code is platform-neutral Rust; the pixi environment and benchmark tooling assume Linux (`/proc`-free paths except `--stats` VmHWM-free output, `/dev/null`, CPU affinity). |
+| Non-x86_64 (ARM64) | Untested. Inference is scalar and portable, but no tuning or verification has been done. |
+| `.ftz` quantized models | Not supported (explicit error), by design. |
+
+## 5. Dependencies
+
+Runtime: `clap` (CLI), `byteorder` (LE header fields), `serde` + `serde_json`
+(JSONL parsing/annotation). Everything else is `std`. Deliberately excluded:
+`tch-rs`/`onnxruntime` (runtime overhead, dynamic libraries), external
+BLAS/LAPACK (a 256-wide dot product auto-vectorizes fine), any GPU framework.
+
+## 6. Verification
+
+| Command | What it checks |
+|---|---|
+| `pixi run test-unit` | Hash test vectors, subword rules, ASCII separator semantics |
+| `pixi run test-parity` | Scores vs. official fastText on 5 reference-trained models (all loss heads, mixed n-gram configs, incl. `minn=0`) over 27 edge-case texts × all labels, plus `lid.176.bin` with 127 multilingual texts × 9 labels; tolerance `1e-5` (measured: 0.00e+00) |
+| `pixi run test-fineweb` | 500 reference scores on real corpus data + full-output record preservation; tolerance `1e-5` (measured: 0.00e+00) |
+| `pixi run bench` | Head-to-head streaming-filter benchmark vs. the official fastText Python binding (see README for methodology and caveats) |
+
+Models and corpora are not committed; download scripts live in `data/`.
