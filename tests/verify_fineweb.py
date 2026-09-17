@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
-import urllib.request
+from itertools import zip_longest
 
 import fasttext
 
@@ -15,7 +14,7 @@ RUST_OUT_PATH = DATA_DIR / "fineweb_scored_rust.jsonl"
 REF_OUT_PATH = DATA_DIR / "fineweb_scored_ref.jsonl"
 BINARY_PATH = Path("target/release/ft-filter")
 
-EPSILON = 1e-4
+EPSILON = 1e-5
 TARGET_DATA_BYTES = 50 * 1024 * 1024  # 50 MB
 SAMPLE_LIMIT = 500  # Number of records to verify against slow reference
 
@@ -76,6 +75,14 @@ def run_rust_inference():
         "0.0",
     ]
     subprocess.run(cmd, check=True)
+    with open(VAL_DATA_PATH, encoding="utf-8") as source, \
+         open(RUST_OUT_PATH, encoding="utf-8") as output:
+        for src_line, out_line in zip_longest(source, output):
+            assert src_line is not None and out_line is not None, "Record count mismatch"
+            src = json.loads(src_line)
+            actual = json.loads(out_line)
+            assert actual.pop("ft_score") is not None
+            assert actual == src, "Records were dropped, reordered, or changed"
     print(f"[+] Rust inference complete -> {RUST_OUT_PATH}")
 
 
@@ -130,6 +137,7 @@ def generate_reference_and_verify():
     print(f"Allowed tolerance : {EPSILON:.2e}")
     print(f"Mismatches        : {mismatches}")
 
+    assert checked == SAMPLE_LIMIT, f"Expected {SAMPLE_LIMIT} records, checked {checked}"
     if mismatches > 0:
         print("\n[FAIL] Numerical parity check failed.")
         sys.exit(1)

@@ -1,66 +1,58 @@
 #[inline(always)]
 pub fn fasttext_hash(bytes: &[u8]) -> u32 {
-    let mut h: u32 = 2166136261;
-    for &b in bytes {
-        h = (h ^ (b as u32)).wrapping_mul(16777619);
-    }
-    h
+    bytes.iter().fold(2166136261, |h, &b| hash_byte(h, b))
 }
 
-/// Computes subword hashes strictly on UTF-8 byte slices, matching official FastText C++.
-/// Character boundary n-grams are extracted over byte lengths between minn and maxn.
+#[inline(always)]
+fn hash_byte(h: u32, b: u8) -> u32 {
+    // Upstream deliberately sign-extends bytes for compatibility with old models.
+    (h ^ (b as i8 as u32)).wrapping_mul(16777619)
+}
+
+/// FastText splits only these ASCII bytes, not punctuation or Unicode whitespace.
+/// JSONL documents are treated as a single line (embedded LF becomes whitespace).
+pub fn tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.split([' ', '\n', '\r', '\t', '\u{000b}', '\u{000c}', '\0'])
+        .filter(|token| !token.is_empty())
+}
+
+/// Visit UTF-8 character n-grams of the virtual string `<word>` without allocating.
+/// Only the standalone boundary characters are excluded, not the whole `<word>`.
 pub fn get_subword_hashes(
     word: &str,
     minn: usize,
     maxn: usize,
     bucket: usize,
-    out_ids: &mut Vec<usize>,
+    mut emit: impl FnMut(usize),
 ) {
-    if minn == 0 || maxn == 0 || minn > maxn || bucket == 0 {
+    if maxn == 0 || minn > maxn || bucket == 0 || word == "</s>" {
         return;
     }
-
-    let mut wrapped = Vec::with_capacity(word.len() + 2);
-    wrapped.push(b'<');
-    wrapped.extend_from_slice(word.as_bytes());
-    wrapped.push(b'>');
-
-    let total_bytes = wrapped.len();
-
-    // Collect all char byte boundaries so n-grams don't split valid multi-byte UTF-8 codepoints
-    let mut char_boundaries = Vec::with_capacity(total_bytes + 1);
-    let mut idx = 0;
-    while idx < total_bytes {
-        char_boundaries.push(idx);
-        let b = wrapped[idx];
-        if b < 0x80 {
-            idx += 1;
-        } else if (b & 0xE0) == 0xC0 {
-            idx += 2;
-        } else if (b & 0xF0) == 0xE0 {
-            idx += 3;
-        } else {
-            idx += 4;
+    let bytes = word.as_bytes();
+    let len = bytes.len() + 2;
+    let byte_at = |i: usize| match i {
+        0 => b'<',
+        i if i == len - 1 => b'>',
+        i => bytes[i - 1],
+    };
+    for i in 0..len {
+        if byte_at(i) & 0xc0 == 0x80 {
+            continue;
         }
-    }
-    char_boundaries.push(total_bytes);
-
-    let num_chars = char_boundaries.len() - 1;
-
-    for i in 0..num_chars {
-        for j in i..num_chars {
-            let char_len = j - i + 1;
-            if char_len >= minn && char_len <= maxn {
-                // Official FastText rule: do not re-add the full original token boundary <word>
-                if !(i == 0 && j == num_chars - 1) {
-                    let start_byte = char_boundaries[i];
-                    let end_byte = char_boundaries[j + 1];
-                    let h = fasttext_hash(&wrapped[start_byte..end_byte]);
-                    out_ids.push((h as usize) % bucket);
-                }
-            }
-            if char_len > maxn {
+        let mut j = i;
+        let mut h = 2166136261;
+        for n in 1..=maxn {
+            if j == len {
                 break;
+            }
+            h = hash_byte(h, byte_at(j));
+            j += 1;
+            while j < len && byte_at(j) & 0xc0 == 0x80 {
+                h = hash_byte(h, byte_at(j));
+                j += 1;
+            }
+            if n >= minn && !(n == 1 && (i == 0 || j == len)) {
+                emit(h as usize % bucket);
             }
         }
     }
@@ -71,8 +63,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fasttext_hash_parity() {
+    fn hash_reference_vectors() {
         assert_eq!(fasttext_hash(b"hello"), 1335831723);
-        assert_eq!(fasttext_hash(b"<the>"), 2180892062);
+        assert_eq!(fasttext_hash(b"<the>"), 4243648960);
+        assert_eq!(fasttext_hash(b"\xff"), 4193493326);
+    }
+
+    #[test]
+    fn subwords_include_whole_word_but_not_single_boundaries() {
+        let mut ids = Vec::new();
+        get_subword_hashes("é", 0, 3, 2_000_000, |id| ids.push(id));
+        let expected: Vec<_> = ["<é", "<é>", "é", "é>"]
+            .iter()
+            .map(|s| fasttext_hash(s.as_bytes()) as usize % 2_000_000)
+            .collect();
+        assert_eq!(ids, expected);
+        ids.clear();
+        get_subword_hashes("</s>", 1, 6, 2_000_000, |id| ids.push(id));
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn ascii_separators_only() {
+        assert_eq!(
+            tokens("a\0b\tc\nd\re\u{000b}f\u{000c}g a\u{00a0}b hi,there").collect::<Vec<_>>(),
+            ["a", "b", "c", "d", "e", "f", "g", "a\u{00a0}b", "hi,there"]
+        );
     }
 }

@@ -48,6 +48,23 @@ Options:
 
 ## Verification & Quick Start
 
+Run the parity checks in the Pixi environment:
+
+```bash
+pixi run test-unit
+pixi run test-parity   # requires data/lid.176.bin; also trains tiny temporary reference models
+pixi run test-fineweb  # requires data/ultra_fineweb_en.bin; downloads evaluation data if absent
+```
+
+Both parity suites enforce an absolute tolerance of `1e-5`. The language-ID
+suite covers multilingual text, ASCII versus Unicode whitespace, OOV words,
+subwords, word n-grams, EOS, and all supported loss heads. The FineWeb suite
+checks 500 reference scores and verifies that the full output preserves records.
+JSONL text is scored as one document, equivalent to Python fastText's
+`model.predict(text.replace("\n", " "))`; embedded newlines do not terminate it.
+Scores retain upstream's `1e-5` smoothing and may slightly exceed 1.0.
+
+
 ### 1. Language Identification (`lid.176.bin`)
 
 Download the official FastText language identifier (~131 MB):

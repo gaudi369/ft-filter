@@ -10,7 +10,11 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "ft-filter", version, about = "High-throughput CPU FastText engine")]
+#[command(
+    name = "ft-filter",
+    version,
+    about = "High-throughput CPU FastText engine"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -93,7 +97,11 @@ fn run_filter(args: FilterArgs) -> io::Result<()> {
     let model = model::Model::load_from_bytes(&mmap)?;
 
     let target_label = args.label.clone().unwrap_or_else(|| {
-        model.labels.first().cloned().expect("Model contains no output labels")
+        model
+            .labels
+            .first()
+            .cloned()
+            .expect("Model contains no output labels")
     });
     let label_idx = *model
         .label2id
@@ -116,7 +124,8 @@ fn run_filter(args: FilterArgs) -> io::Result<()> {
     let is_jsonl = args.format == "jsonl";
 
     while reader.read_line(&mut line_buf)? > 0 {
-        let trimmed_line = line_buf.trim_end();
+        // Remove record framing only: Unicode whitespace can be part of a token.
+        let trimmed_line = line_buf.trim_end_matches(['\r', '\n']);
         if trimmed_line.is_empty() {
             line_buf.clear();
             continue;

@@ -1,6 +1,6 @@
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor};
 
 pub const FASTTEXT_MAGIC: i32 = 0x2F4F16BA; // 793712314
 pub const FASTTEXT_VERSION: i32 = 12;
@@ -13,7 +13,7 @@ pub struct Args {
     pub min_count: i32,
     pub neg: i32,
     pub word_ngrams: i32,
-    pub loss: i32, // 1: hs (hierarchical softmax), 2: ns, 3: softmax
+    pub loss: i32,  // 1: hs (hierarchical softmax), 2: ns, 3: softmax
     pub model: i32, // 1: cbow, 2: sg, 3: supervised
     pub bucket: usize,
     pub minn: usize,
@@ -40,13 +40,21 @@ pub struct Model {
     pub label2id: HashMap<String, usize>,
     pub num_words: usize,
     pub num_labels: usize,
-    pub win: Vec<f32>,  // Shape: (num_words + bucket) * dim
-    pub wout: Vec<f32>, // Shape: num_labels * dim or (num_labels - 1) * dim for HS
+    pub win: Vec<f32>,          // Shape: (num_words + bucket) * dim
+    pub wout: Vec<f32>,         // Shape: num_labels * dim or (num_labels - 1) * dim for HS
     pub paths: Vec<Vec<usize>>, // For hierarchical softmax: path of internal node indices
     pub codes: Vec<Vec<bool>>,  // Binary branch decisions (true = right, false = left)
+    pub pruneidx: Option<HashMap<usize, usize>>,
 }
 
 impl Model {
+    pub fn bucket_id(&self, bucket: usize) -> Option<usize> {
+        match &self.pruneidx {
+            None => Some(self.num_words + bucket),
+            Some(indices) => indices.get(&bucket).map(|id| self.num_words + id),
+        }
+    }
+
     /// Builds the exact binary Huffman tree matching FastText C++ Dictionary::initTree
     fn build_huffman_tree(label_counts: &[i64]) -> (Vec<Vec<usize>>, Vec<Vec<bool>>) {
         let k = label_counts.len();
@@ -123,13 +131,19 @@ impl Model {
         if magic != FASTTEXT_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Invalid FastText magic number: expected 0x{:X}, got 0x{:X}", FASTTEXT_MAGIC, magic),
+                format!(
+                    "Invalid FastText magic number: expected 0x{:X}, got 0x{:X}",
+                    FASTTEXT_MAGIC, magic
+                ),
             ));
         }
 
         let version = r.read_i32::<LittleEndian>()?;
         if version > FASTTEXT_VERSION {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Unsupported model version"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unsupported model version",
+            ));
         }
 
         let args = Args {
@@ -153,11 +167,6 @@ impl Model {
         let _num_labels = r.read_i32::<LittleEndian>()?;
         let _ntokens = r.read_i64::<LittleEndian>()?;
         let pruneidx_size = r.read_i64::<LittleEndian>()?;
-
-        if pruneidx_size > 0 {
-            // Skip pruneidx table: pruneidx_size * 8 bytes (two i32)
-            r.set_position(r.position() + (pruneidx_size as u64) * 8);
-        }
 
         let mut words = Vec::new();
         let mut labels = Vec::new();
@@ -190,6 +199,19 @@ impl Model {
             }
         }
 
+        // The pruning map follows dictionary entries, not the dictionary header.
+        let pruneidx = if pruneidx_size >= 0 {
+            let mut indices = HashMap::new();
+            for _ in 0..pruneidx_size {
+                let bucket = r.read_i32::<LittleEndian>()? as usize;
+                let id = r.read_i32::<LittleEndian>()? as usize;
+                indices.insert(bucket, id);
+            }
+            Some(indices)
+        } else {
+            None
+        };
+
         let (paths, codes) = if args.loss == 1 {
             Self::build_huffman_tree(&label_counts)
         } else {
@@ -202,7 +224,10 @@ impl Model {
         // 1. Quant flag for Win
         let is_quant_in = r.read_u8()?;
         if is_quant_in != 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Quantized Win not supported"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Quantized Win not supported",
+            ));
         }
 
         let win_rows = r.read_i64::<LittleEndian>()? as usize;
@@ -216,7 +241,10 @@ impl Model {
         // 2. Quant flag for Wout
         let is_quant_out = r.read_u8()?;
         if is_quant_out != 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Quantized Wout not supported"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Quantized Wout not supported",
+            ));
         }
 
         let wout_rows = r.read_i64::<LittleEndian>()? as usize;
@@ -240,6 +268,7 @@ impl Model {
             wout,
             paths,
             codes,
+            pruneidx,
         })
     }
 }
