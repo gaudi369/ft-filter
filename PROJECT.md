@@ -7,7 +7,6 @@ Goals
  * Low Memory Footprint: Keep RAM overhead under 2 GB (storing only model parameters and small per-document accumulation buffers).
  * Deterministic Output: Produce numerical classification probabilities that match the official C++ FastText output to within floating-point epsilon (\le 10^{-5}).
 Non-Goals
- * Training & Fine-Tuning: Inference-only.
  * FP16 / Sub-Byte Quantization: Maintain FP32 weights exclusively to preserve simplicity and avoid conversion latency on consumer x86_64 chips.
  * Multi-Threading / Thread Pools: Keep code strictly single-threaded. Concurrency is delegated to the operating system (e.g., via xargs -P or GNU parallel over separate files).
  * GPU / DirectML / Metal Acceleration: Pure CPU implementation.

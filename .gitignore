@@ -20,3 +20,6 @@ data/*.jsonl
 Thumbs.db
 *.swp
 *~
+# pixi environments
+.pixi/*
+!.pixi/config.toml
