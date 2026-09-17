@@ -45,9 +45,59 @@ pub struct Model {
     pub paths: Vec<Vec<usize>>, // For hierarchical softmax: path of internal node indices
     pub codes: Vec<Vec<bool>>,  // Binary branch decisions (true = right, false = left)
     pub pruneidx: Option<HashMap<usize, usize>>,
+    // Ordered, already-pruned subword IDs for a bounded vocabulary prefix.
+    // FastText stores vocabulary in descending frequency order.
+    subword_offsets: Vec<usize>,
+    subword_ids: Vec<usize>,
 }
 
 impl Model {
+    pub fn cached_subwords(&self, word_id: usize) -> Option<&[usize]> {
+        let end = *self.subword_offsets.get(word_id + 1)?;
+        Some(&self.subword_ids[self.subword_offsets[word_id]..end])
+    }
+
+    fn cache_subwords(&mut self) {
+        self.cache_subwords_with_limits(65_536, 1_048_576);
+    }
+
+    fn cache_subwords_with_limits(&mut self, max_words: usize, max_ids: usize) {
+        self.subword_offsets.clear();
+        self.subword_ids.clear();
+        if self.args.maxn == 0 || self.args.bucket == 0 {
+            return;
+        }
+        // At most 8 MiB of IDs + 512 KiB of offsets on a 64-bit host.
+        // Never cache a partial word. All other words use the original generator.
+        let mut ids = Vec::new();
+        self.subword_offsets.push(0);
+        for word in self.words.iter().take(max_words) {
+            let start = ids.len();
+            let mut overflow = false;
+            crate::tokenize::get_subword_hashes(
+                word,
+                self.args.minn,
+                self.args.maxn,
+                self.args.bucket,
+                |bucket| {
+                    if let Some(id) = self.bucket_id(bucket) {
+                        if ids.len() < max_ids {
+                            ids.push(id);
+                        } else {
+                            overflow = true;
+                        }
+                    }
+                },
+            );
+            if overflow {
+                ids.truncate(start);
+                break;
+            }
+            self.subword_offsets.push(ids.len());
+        }
+        self.subword_ids = ids;
+    }
+
     pub fn bucket_id(&self, bucket: usize) -> Option<usize> {
         match &self.pruneidx {
             None => Some(self.num_words + bucket),
@@ -255,7 +305,7 @@ impl Model {
             *val = r.read_f32::<LittleEndian>()?;
         }
 
-        Ok(Model {
+        let mut model = Model {
             args,
             words,
             labels,
@@ -269,6 +319,10 @@ impl Model {
             paths,
             codes,
             pruneidx,
-        })
+            subword_offsets: Vec::new(),
+            subword_ids: Vec::new(),
+        };
+        model.cache_subwords();
+        Ok(model)
     }
 }

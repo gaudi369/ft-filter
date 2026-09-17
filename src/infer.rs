@@ -53,6 +53,8 @@ impl InferSession {
         self.accumulator.fill(0.0);
         self.word_hashes.clear();
         let dim = model.args.dim;
+        // Compute token hashes only when word n-grams will consume them.
+        let use_word_ngrams = model.args.word_ngrams > 1 && model.args.bucket > 0;
         let mut total_features = 0usize;
         let accumulator = &mut self.accumulator;
         let mut add_feature = |id: usize| {
@@ -65,32 +67,41 @@ impl InferSession {
         // word n-grams. Like Python predict, append EOS to each document.
         for token in tokens(text).chain(std::iter::once("</s>")) {
             let wid = model.word2id.get(token).copied();
-            let is_label = model.label2id.contains_key(token)
-                || (wid.is_none() && token.starts_with("__label__"));
+            // A known word cannot also be a label in a valid dictionary.
+            let is_label = wid.is_none()
+                && (token.starts_with("__label__") || model.label2id.contains_key(token));
             if !is_label {
-                self.word_hashes
-                    .push(fasttext_hash(token.as_bytes()) as i32);
+                if use_word_ngrams {
+                    self.word_hashes
+                        .push(fasttext_hash(token.as_bytes()) as i32);
+                }
                 if let Some(id) = wid {
                     add_feature(id);
                 }
-                get_subword_hashes(
-                    token,
-                    model.args.minn,
-                    model.args.maxn,
-                    model.args.bucket,
-                    |b| {
-                        if let Some(id) = model.bucket_id(b) {
-                            add_feature(id);
-                        }
-                    },
-                );
+                if let Some(ids) = wid.and_then(|id| model.cached_subwords(id)) {
+                    for &id in ids {
+                        add_feature(id);
+                    }
+                } else {
+                    get_subword_hashes(
+                        token,
+                        model.args.minn,
+                        model.args.maxn,
+                        model.args.bucket,
+                        |b| {
+                            if let Some(id) = model.bucket_id(b) {
+                                add_feature(id);
+                            }
+                        },
+                    );
+                }
             }
             if token == "</s>" {
                 break;
             }
         }
 
-        if model.args.word_ngrams > 1 && model.args.bucket > 0 {
+        if use_word_ngrams {
             for i in 0..self.word_hashes.len() {
                 // C++ converts signed int32 hashes to uint64 (sign extension).
                 let mut h = self.word_hashes[i] as u64;
