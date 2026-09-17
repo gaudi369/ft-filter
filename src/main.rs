@@ -59,6 +59,10 @@ pub struct FilterArgs {
 
     #[arg(short = 'l', long = "label")]
     pub label: Option<String>,
+
+    /// Print timing and workload statistics as JSON to stderr
+    #[arg(long = "stats", default_value_t = false)]
+    pub stats: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -92,9 +96,14 @@ pub struct TrainArgs {
 }
 
 fn run_filter(args: FilterArgs) -> io::Result<()> {
+    let load_start = std::time::Instant::now();
     let model_file = File::open(&args.model)?;
     let mmap = unsafe { Mmap::map(&model_file)? };
     let model = model::Model::load_from_bytes(&mmap)?;
+    let mut stats = Stats {
+        load_seconds: load_start.elapsed().as_secs_f64(),
+        ..Stats::default()
+    };
 
     let target_label = args.label.clone().unwrap_or_else(|| {
         model
@@ -122,8 +131,12 @@ fn run_filter(args: FilterArgs) -> io::Result<()> {
     let mut line_buf = String::with_capacity(16384);
     let mut reader = reader;
     let is_jsonl = args.format == "jsonl";
+    let process_start = std::time::Instant::now();
 
     while reader.read_line(&mut line_buf)? > 0 {
+        if args.stats {
+            stats.input_bytes += line_buf.len() as u64;
+        }
         // Remove record framing only: Unicode whitespace can be part of a token.
         let trimmed_line = line_buf.trim_end_matches(['\r', '\n']);
         if trimmed_line.is_empty() {
@@ -131,6 +144,9 @@ fn run_filter(args: FilterArgs) -> io::Result<()> {
             continue;
         }
 
+        if args.stats {
+            stats.records += 1;
+        }
         let mut parsed_obj = None;
         let prob = if is_jsonl {
             if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed_line) {
@@ -157,6 +173,9 @@ fn run_filter(args: FilterArgs) -> io::Result<()> {
         };
 
         if passes {
+            if args.stats {
+                stats.passed_records += 1;
+            }
             if args.emit_score {
                 if is_jsonl {
                     if let Some(mut map) = parsed_obj {
@@ -177,7 +196,21 @@ fn run_filter(args: FilterArgs) -> io::Result<()> {
     }
 
     writer.flush()?;
+    stats.process_seconds = process_start.elapsed().as_secs_f64();
+    if args.stats {
+        serde_json::to_writer(io::stderr().lock(), &stats)?;
+        eprintln!();
+    }
     Ok(())
+}
+
+#[derive(serde::Serialize, Default)]
+struct Stats {
+    records: u64,
+    input_bytes: u64,
+    passed_records: u64,
+    process_seconds: f64,
+    load_seconds: f64,
 }
 
 fn main() -> io::Result<()> {

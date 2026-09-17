@@ -16,5 +16,6 @@ tqdm = ">=4.66.0"
 [tasks]
 build-release = "cargo build --release"
 test-unit = "cargo test"
+bench = { cmd = "python tests/benchmark.py", depends-on = ["build-release"] }
 test-parity = { cmd = "python tests/verify_parity.py", depends-on = ["build-release"] }
 test-fineweb = { cmd = "python tests/verify_fineweb.py", depends-on = ["build-release"] }

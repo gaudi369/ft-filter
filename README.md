@@ -65,6 +65,56 @@ JSONL text is scored as one document, equivalent to Python fastText's
 Scores retain upstream's `1e-5` smoothing and may slightly exceed 1.0.
 
 
+### Performance comparison
+
+```bash
+# Default: language-ID model, local FineWeb corpus, 1 warmup + 3 measured runs per engine
+pixi run bench
+
+# Short smoke test, or a longer run with machine-readable results
+pixi run bench --limit 500 --warmups 0 --runs 1
+pixi run bench --runs 5 --report /tmp/ft-filter-benchmark.json
+
+# Compare the quality classifier instead
+pixi run bench --model data/ultra_fineweb_en.bin --label __label__pos
+```
+
+Use `pixi run bench --help` for input, JSON key, threshold, label, and optional
+Linux CPU-affinity (`--cpu`) settings. Models and input must already exist;
+benchmarking never downloads data. The release build runs before measurements.
+
+The benchmark compares **streaming filtering pipelines**, Rust versus the official
+fastText Python binding installed by Pixi. An untimed streaming pass creates the
+same normalized JSONL input for both (only the text field, embedded LF replaced
+by spaces). Both use the same target label and threshold, write retained records
+to `/dev/null`, and must agree on processed bytes, records, and retained counts.
+The reference calls `predict(k=-1)` to retrieve the target score; Rust evaluates
+the requested label directly. Python JSON parsing and binding overhead are part
+of the comparison, so this is **not an isolated C++ versus Rust kernel benchmark**.
+Run the parity suites separately to verify numerical agreement.
+
+Each trial uses a fresh process; engine order alternates, warmups are discarded,
+and filesystem caches are not cleared. Reports include:
+
+- Processing median/min/max and coefficient of variation
+- Model-load and end-to-end wall time, total worker CPU time, and peak RSS
+- Records/s, ASCII lexical tokens/s, text MiB/s, retained counts, and speedup
+- Optional JSON with every trial, workload sizes, and environment metadata
+
+Processing includes parsing, inference, filtering, and buffered output, but excludes
+model loading and runtime startup. End-to-end includes startup/imports/teardown;
+Rust end-to-end also includes a small Python launcher. CPU/RSS cover the entire
+engine process (including model load and Python imports for the reference).
+Tokens are counted once outside timing using fastText's ASCII separators; they
+are not subword features and exclude synthetic EOS. Temporary input uses disk
+space proportional to the corpus, while preparation and inference are streaming.
+There are no per-record timers or memory-sampling threads. Timings are informative,
+not pass/fail performance gates; CPU frequency and background load affect results.
+
+The Rust CLI also accepts `filter --stats`, which emits a single JSON object on
+stderr with load/processing seconds, input bytes, processed records, and passed
+records without changing stdout.
+
 ### 1. Language Identification (`lid.176.bin`)
 
 Download the official FastText language identifier (~131 MB):
