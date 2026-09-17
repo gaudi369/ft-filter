@@ -1,0 +1,10 @@
+[build]
+# FineWeb-class models run ~30% faster with AVX2 codegen. x86-64-v3 implies
+# an AVX2-era CPU baseline (Haswell 2013+): the binary may use AVX2 anywhere
+# the optimizer chooses and WILL abort with SIGILL on older x86_64 CPUs.
+# This matches the AVX2 consumer-CPU target in PROJECT.md; drop this file to
+# build a conservative baseline-x86_64 binary instead.
+#
+# `native` additionally assumes the exact ISA of the build machine, which
+# breaks binary portability and is deliberately NOT set.
+rustflags = ["-C", "target-cpu=x86-64-v3"]
