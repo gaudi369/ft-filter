@@ -110,4 +110,5 @@ BLAS/LAPACK (a 256-wide dot product auto-vectorizes fine), any GPU framework.
 | `pixi run test-fineweb` | 500 reference scores on real corpus data + full-output record preservation; tolerance `1e-5` (measured: 0.00e+00) |
 | `pixi run bench` | Head-to-head streaming-filter benchmark vs. the official fastText Python binding (see README for methodology and caveats) |
 
-Models and corpora are not committed; download scripts live in `data/`.
+Models and corpora in `data/` are not committed. See README for model downloads;
+`pixi run test-fineweb` downloads the evaluation corpus if absent.
