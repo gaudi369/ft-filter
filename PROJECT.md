@@ -13,9 +13,9 @@ Non-Goals
  * Dynamic Training Dictionaries: No complex vocabulary tree mutations; treat the loaded model as immutable data.
 2. Dependencies & Ecosystem Choices
 The implementation should be written in Rust to enforce strict memory safety and avoid external runtime dependencies.
- * memmap2: Memory-mapping model files and input corpora directly into address space with zero disk-to-heap copies.
  * serde + serde_json: Zero-copy or borrowed parsing for JSONL documents (extracting the "text" field).
  * byteorder: Reading little-endian binary headers from FastText .bin checkpoints.
+ * std::io streaming: Model matrices are bulk-read from the file in bounded chunks instead of being copied out of a memory map. FastText stores matrices at byte-unaligned file offsets (dictionary entries have variable length), so mmap-based loading inevitably touches every matrix page and then doubles peak RSS with a heap copy; streaming load halves it (e.g. 4.0 GiB -> 2.0 GiB for the 2 GB UltraFineWeb model). memmap2 was removed when the last mmap use disappeared.
  * clap: CLI flag and argument parsing.
 Deliberately Excluded (Avoid Implementing or Adding):
  * tch-rs or onnxruntime: Adds runtime overhead and dynamic library dependencies.

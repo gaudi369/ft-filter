@@ -3,7 +3,6 @@ mod model;
 mod tokenize;
 
 use clap::{Args, Parser, Subcommand};
-use memmap2::Mmap;
 use serde_json::Value;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -98,8 +97,9 @@ pub struct TrainArgs {
 fn run_filter(args: FilterArgs) -> io::Result<()> {
     let load_start = std::time::Instant::now();
     let model_file = File::open(&args.model)?;
-    let mmap = unsafe { Mmap::map(&model_file)? };
-    let model = model::Model::load_from_bytes(&mmap)?;
+    // Streaming load: matrices are read directly from the file, so the mmap
+    // path (which doubled peak RSS) is no longer used.
+    let model = model::Model::load_from_reader(model_file)?;
     let mut stats = Stats {
         load_seconds: load_start.elapsed().as_secs_f64(),
         ..Stats::default()

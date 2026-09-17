@@ -1,6 +1,6 @@
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::collections::HashMap;
-use std::io::{self, Cursor};
+use std::io::{self, BufReader, Read};
 
 pub const FASTTEXT_MAGIC: i32 = 0x2F4F16BA; // 793712314
 pub const FASTTEXT_VERSION: i32 = 12;
@@ -174,8 +174,30 @@ impl Model {
         (paths, codes)
     }
 
-    pub fn load_from_bytes(data: &[u8]) -> io::Result<Self> {
-        let mut r = Cursor::new(data);
+    /// Reads `len` little-endian f32 values in bounded chunks so the raw
+    /// byte staging buffer stays small while the full matrix is materialized.
+    fn read_matrix(reader: &mut impl Read, len: usize) -> io::Result<Vec<f32>> {
+        const CHUNK_FLOATS: usize = 1 << 21; // 2 Mi floats = 8 MiB of bytes
+        let mut values = vec![0.0f32; len];
+        let mut staging = vec![0u8; CHUNK_FLOATS * 4];
+        let mut offset = 0;
+        while offset < len {
+            let take = (len - offset).min(CHUNK_FLOATS);
+            reader.read_exact(&mut staging[..take * 4])?;
+            for (i, chunk) in staging[..take * 4].chunks_exact(4).enumerate() {
+                values[offset + i] = f32::from_le_bytes(chunk.try_into().unwrap());
+            }
+            offset += take;
+        }
+        Ok(values)
+    }
+
+    /// Loads a model by streaming from `reader`. Header, dictionary, and
+    /// matrices are parsed sequentially; matrices are read with bulk reads
+    /// into owned buffers instead of being copied out of a full-file mmap,
+    /// which halves peak RSS for large models.
+    pub fn load_from_reader<R: Read>(reader: R) -> io::Result<Self> {
+        let mut r = BufReader::with_capacity(1 << 20, reader);
 
         let magic = r.read_i32::<LittleEndian>()?;
         if magic != FASTTEXT_MAGIC {
@@ -282,11 +304,12 @@ impl Model {
 
         let win_rows = r.read_i64::<LittleEndian>()? as usize;
         let win_cols = r.read_i64::<LittleEndian>()? as usize;
-        let win_len = win_rows * win_cols;
-        let mut win = vec![0.0f32; win_len];
-        for val in win.iter_mut() {
-            *val = r.read_f32::<LittleEndian>()?;
-        }
+        let win = Self::read_matrix(
+            &mut r,
+            win_rows
+                .checked_mul(win_cols)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Matrix too large"))?,
+        )?;
 
         // 2. Quant flag for Wout
         let is_quant_out = r.read_u8()?;
@@ -299,11 +322,12 @@ impl Model {
 
         let wout_rows = r.read_i64::<LittleEndian>()? as usize;
         let wout_cols = r.read_i64::<LittleEndian>()? as usize;
-        let wout_len = wout_rows * wout_cols;
-        let mut wout = vec![0.0f32; wout_len];
-        for val in wout.iter_mut() {
-            *val = r.read_f32::<LittleEndian>()?;
-        }
+        let wout = Self::read_matrix(
+            &mut r,
+            wout_rows
+                .checked_mul(wout_cols)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Matrix too large"))?,
+        )?;
 
         let mut model = Model {
             args,
